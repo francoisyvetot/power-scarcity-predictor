@@ -7,6 +7,8 @@ import xgboost as xgb
 import shap 
 from Scarcity_visualizer import InteractiveScarcityVisualizer
 from metrics import PowerSystemDiagnostics
+
+
 class PowerDataLoader:
     def __init__(self, base_path: str, bidding_zone: list, weather_scenario: list, target_year: list):
         self.base_path = base_path
@@ -47,12 +49,33 @@ class PowerDataLoader:
 
 class TargetBuilder:
     """Class responsible for defining the target variable to predict"""
-
-    def build_target(self, df_system: pd.DataFrame) -> pd.Series:
+    @staticmethod
+    def build_hourly_scarcity_flag(df_system: pd.DataFrame) -> pd.Series:
         """Transforms the unserved energy into a binary or continuous target."""
-        target = (df_system['Unserved_Energy_MWh'] > 0.1).astype(int)
-        target.name = 'Scarcity_Target'
-        return target
+        flag = (df_system['Price_Euro_MWh'] > 500).astype(int)  # Or Unserved_Energy_MWh if we are working on post CS solution files
+        flag.name = 'Scarcity_Target'
+        return flag
+    
+    @staticmethod
+    def _with_week_key(df_system: pd.DataFrame) -> pd.DataFrame:
+        """Adds a 'Week' column to the DataFrame for weekly aggregation."""
+        iso = df_system.index.isocalendar()
+        out = df_system.copy()
+        out["ISO_Year"]=iso["year"].values
+        out["ISO_Week"]=iso["week"].values
+        out["ISO_Day"]=iso["day"].values
+        out["Scarcity_Hour"] = TargetBuilder.build_hourly_scarcity_flag(df_system).values
+        
+        return out
+    
+    @staticmethod
+    def build_weekly_target(df_system: pd.DataFrame) -> pd.Series:
+
+        df = TargetBuilder._with_week_key(df_system)
+        group_cols = ['Bidding Zone', 'WS', 'TY', 'ISO_Year', 'ISO_Week']
+        weekly_flag = df.groupby(group_cols)['Scarcity_Hour'].transform('max')
+        weekly_flag.name = 'Scarcity_Week_Flag'
+        return weekly_flag
 
 class FeatureEngineer:
     """Class responsible for creating features for ML models"""
@@ -70,36 +93,113 @@ class FeatureEngineer:
         
         X_df['Total_RES'] = X_df[self.res_columns].sum(axis=1)
         X_df['Net_Load'] = X_df['Load_MW'] - X_df['Total_RES']
-                
+        X_df['Net_Load_Core'] = X_df.groupby([X_df.index, 'WS','TY'])['Net_Load'].transform('sum')
         # Features Temporelles
         X_df['Hour'] = X_df.index.hour
         X_df['DayOfWeek'] = X_df.index.dayofweek
         X_df['Month'] = X_df.index.month
-        X_df['IsWeekend'] = X_df['DayOfWeek'].isin([5, 6]).astype(int)
         
-        # CORRECTION CRITIQUE : Calcul des Lags PAR Bidding Zone et PAR Scenario Météo
-        # On utilise groupby pour éviter que les données d'une zone ne bavent sur une autre
         grouped = X_df.groupby(['Bidding Zone', 'WS', 'TY'])
-        
         for lag in [1, 2, 24]:
             X_df[f'Load_Lag_{lag}'] = grouped['Load_MW'].shift(lag)
             X_df[f'Net_Load_Lag_{lag}'] = grouped['Net_Load'].shift(lag)
             
         # Encodage de la Bidding Zone (XGBoost sait gérer les catégories s'ils sont convertis en type 'category')
         X_df['Bidding Zone'] = X_df['Bidding Zone'].astype('category')
-            
+
+        print(f"Features generated: {list(X_df.columns)}")
+        
         return X_df.dropna()
 
+class WeeklyAggregator:
+    """
+    Couche de décision/évaluation hebdomadaire, appliquée APRÈS l'entraînement.
+    Le modèle est entraîné sur le flag horaire brut (aligné avec ses features).
+    Cette classe agrège ses probabilités horaires en un score/flag hebdomadaire
+    pour la décision opérationnelle (déclencher ou non une simulation haute
+    résolution sur la semaine) et pour l'évaluation au bon grain.
+    """
+ 
+    @staticmethod
+    def _week_keys(X: pd.DataFrame) -> pd.DataFrame:
+        iso = X.index.isocalendar()
+        keys = pd.DataFrame({
+            'Bidding Zone': X['Bidding Zone'].values,
+            'WS': X['WS'].values,
+            'TY': X['TY'].values,
+            'ISO_Year': iso['year'].values,
+            'ISO_Week': iso['week'].values,
+        }, index=X.index)
+        return keys
+ 
+    @staticmethod
+    def aggregate(X: pd.DataFrame, y_true_hourly: pd.Series, probs_hourly: np.ndarray,
+                  agg: str = "max") -> pd.DataFrame:
+        """
+        Agrège probas + vrai flag horaire au niveau (Bidding Zone, WS, TY, ISO_Week).
+        agg: 'max' (au moins une heure à risque déclenche la semaine) ou 'mean'.
+        y_true_hourly doit être le flag HORAIRE brut (non broadcasté) sur les mêmes
+        lignes que probs_hourly, pour que le label hebdo reconstruit soit correct.
+        """
+        keys = WeeklyAggregator._week_keys(X)
+        keys['prob'] = probs_hourly
+        keys['y_true_hour'] = y_true_hourly.values
+ 
+        group_cols = ['Bidding Zone', 'WS', 'TY', 'ISO_Year', 'ISO_Week']
+        weekly = keys.groupby(group_cols).agg(
+            prob_max=('prob', 'max'),
+            prob_mean=('prob', 'mean'),
+            n_hours_above_50=('prob', lambda s: (s > 0.5).sum()),
+            y_true_week=('y_true_hour', 'max'),
+        ).reset_index()
+ 
+        weekly['prob_week'] = weekly['prob_max'] if agg == "max" else weekly['prob_mean']
+        return weekly
+ 
+    @staticmethod
+    def evaluate(weekly: pd.DataFrame, threshold: float = 0.5) -> None:
+        """Rapport de classification + PR-AUC au grain semaine (décision réelle)."""
+        preds_week = (weekly['prob_week'] > threshold).astype(int)
+        print("\n==================================================")
+        print(f"DIAGNOSTIC HEBDOMADAIRE (agrégation post-hoc, seuil={threshold})")
+        print("==================================================")
+        print(classification_report(weekly['y_true_week'], preds_week, zero_division=0))
+        precision, recall, _ = precision_recall_curve(weekly['y_true_week'], weekly['prob_week'])
+        print(f"PR-AUC (niveau semaine): {auc(recall, precision):.4f}")
+        print("==================================================\n")
+
+ 
 class ScarcityPredictorPipeline:
     """Classe orchestrant l'entraînement du modèle XGBoost et l'évaluation."""
     def __init__(self, feature_cols: list):
         self.feature_cols = feature_cols
         self.model = None
         self.X_test = None
+        self.X_test_full = None # X_test with all columns for post-hoc visualization
         self.y_test = None
         self.X_train = None
         self.y_train = None
 
+    def weekly_from_hourly_probs(self, X: pd.DataFrame, y_hourly: pd.Series, probs_hourly: np.ndarray) -> pd.DataFrame:
+        """
+        Agrège les probabilités horaires prédites + le vrai flag horaire au niveau semaine,
+        pour évaluer la décision opérationnelle réelle (déclencher ou non LA semaine).
+        """
+        df = X[['Bidding Zone']].copy()
+        iso = df.index.isocalendar()
+        df['ISO_Year'] = iso['year'].values
+        df['ISO_Week'] = iso['week'].values
+        df['prob'] = probs_hourly
+        df['y_true_hour'] = y_hourly.values
+
+        weekly = df.groupby(['Bidding Zone', 'ISO_Year', 'ISO_Week']).agg(
+            prob_max=('prob', 'max'),
+            prob_mean=('prob', 'mean'),
+            n_hours_above_50=('prob', lambda s: (s > 0.5).sum()),
+            y_true_week=('y_true_hour', 'max'),   # vrai flag hebdo (au moins 1h positive)
+        ).reset_index()
+
+        return weekly
     def execute_time_series_validation(self, X: pd.DataFrame, y: pd.Series):
         """Découpe les horizons (ex: 2028-2035) proprement pour valider le modèle."""
         # Alignement final des indexes
@@ -114,6 +214,7 @@ class ScarcityPredictorPipeline:
 
         for fold, (train_idx, test_idx) in enumerate(gkf.split(X_features, y, groups)):
             self.X_train, self.X_test = X_features.iloc[train_idx], X_features.iloc[test_idx]
+            self.X_test_full = X.iloc[test_idx]  # For WeeklyAggregator
             self.y_train, self.y_test = y.iloc[train_idx], y.iloc[test_idx]
             
             test_scenarios = np.unique(groups[test_idx])
@@ -141,8 +242,8 @@ class ScarcityPredictorPipeline:
             # Évaluation
             preds = self.model.predict(self.X_test)
             probs = self.model.predict_proba(self.X_test)[:, 1]
-            
             print(classification_report(self.y_test, preds, zero_division=0))
+
             precision, recall, _ = precision_recall_curve(self.y_test, probs)
             print(f"PR-AUC (Indicateur clé Crises Rares): {auc(recall, precision):.4f}")
             PowerSystemDiagnostics.analyze_prediction_thresholds(self.y_test, probs)
@@ -151,10 +252,18 @@ class ScarcityPredictorPipeline:
 
 
 
+
 if __name__ == "__main__":
     DATA_PATH = r"C:\Users\fyvetot\Documents\XGBE\Datasets"
     BZONE = ["DE00","FR00","BE00","CZ00","HU00","IE00","NL00","PL00","SK00","UKNI"]
-    WEATHER_SCENARIO = ["WS03","WS06","WS07","WS10","WS12","WS14","WS15","WS16","WS17","W18","WS19","WS20","WS25","WS27","WS31","WS32","WS35"]
+    WEATHER_SCENARIO = ['WS01','WS02','WS03','WS05','WS06','WS07','WS08','WS09','WS10','WS11',
+                        'WS12','WS13','WS14','WS15','WS16','WS17','WS18','WS19','WS20','WS21',
+                        'WS22','WS23','WS24','WS25','WS26','WS27','WS28','WS29','WS30','WS31',
+                        'WS32','WS33','WS34','WS35','WS36']
+    # WEATHER_SCENARIO = ['WS03','WS06','WS07','WS10', 'WS12','WS14',
+                        # 'WS15','WS16','WS17','WS18','WS19','WS20',
+                        # 'WS25','WS27','WS29','WS31','WS32',]
+    
     TARGET_YEAR = [2035]
 
     loader = PowerDataLoader(base_path=DATA_PATH, bidding_zone=BZONE, weather_scenario=WEATHER_SCENARIO, target_year=TARGET_YEAR)
@@ -163,8 +272,8 @@ if __name__ == "__main__":
     PowerSystemDiagnostics.log_spatial_correlations(df_sys)
     # Call TargetBuilder to build "y" (Scarcity Target)x
     target_builder = TargetBuilder()
-    y = target_builder.build_target(df_sys)
-    
+    y = target_builder.build_hourly_scarcity_flag(df_sys)
+
     # Call FeatureEngineer to generate features
     res_techs = ['Offshore', 'PV', 'Onshore']
     fe_engineer = FeatureEngineer(res_columns=res_techs)
@@ -172,24 +281,29 @@ if __name__ == "__main__":
     
     # Définition des colonnes à envoyer au XGBoost et exécution du pipeline
     features_to_use = [
-        'Bidding Zone','Load_MW', 'Net_Load', 
-        'Hour', 'DayOfWeek', 'IsWeekend', # 'Month',
+        'Bidding Zone','Load_MW', 'Net_Load', 'Net_Load_Core',
+        'Hour', 'DayOfWeek', 'Month',
         'Load_Lag_1', 'Net_Load_Lag_1', 'Load_Lag_24', 'Net_Load_Lag_24'
     ] + res_techs
 
     pipeline = ScarcityPredictorPipeline(feature_cols=features_to_use)
     X_train, y_train, X_test, y_test = pipeline.execute_time_series_validation(X, y)
+    print(f"Overview of the training set : len {len(X_train)} \n{X_train.head(20)} \n{y_train.head(20)} ")
+    print(f"Overview of the test set : len {len(X_test)} \n{X_test.head(20)} \n{y_test.head(20)} ")
+    probs_test = pipeline.model.predict_proba(X_test)[:, 1]
 
-    probs_test = pipeline.model.predict_proba(X_test[features_to_use])[:, 1]
-
-    # Génération et sauvegarde automatique de l'HTML global sans blocage d'affichage
+    weekly_diag = WeeklyAggregator.aggregate(pipeline.X_test_full, y_test, probs_test, agg="max")
+    WeeklyAggregator.evaluate(weekly_diag, threshold=0.5)
+    # print(classification_report(weekly_diag['y_true_week'], preds_week, zero_division=0))
+    # precision, recall, _ = precision_recall_curve(weekly_diag['y_true_week'], weekly_diag['prob_max'])
+    # print(f"PR-AUC (niveau semaine, agrégé): {auc(recall, precision):.4f}")    # Génération et sauvegarde automatique de l'HTML global sans blocage d'affichage
     InteractiveScarcityVisualizer.save_interactive_profile(
         df_test_features=X_test,
         y_true=y_test,
         y_probs=probs_test,
-        bidding_zone="BE00",      # Zone à visualiser
+        bidding_zone="DE00",      # Zone à visualiser
         threshold=0.05,          # Seuil configuré
         output_dir="output",     # Dossier cible
-        file_name="scarcity_global_profile_BE00.html"
+        file_name="scarcity_global_profile_DE00.html"
     )
     
