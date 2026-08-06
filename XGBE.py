@@ -134,7 +134,7 @@ class WeeklyAggregator:
  
     @staticmethod
     def aggregate(X: pd.DataFrame, y_true_hourly: pd.Series, probs_hourly: np.ndarray,
-                  agg: str = "max") -> pd.DataFrame:
+                  agg: str = "max", opt_threshold: float=0.75) -> pd.DataFrame:
         """
         Agrège probas + vrai flag horaire au niveau (Bidding Zone, WS, TY, ISO_Week).
         agg: 'max' (au moins une heure à risque déclenche la semaine) ou 'mean'.
@@ -149,11 +149,12 @@ class WeeklyAggregator:
         weekly = keys.groupby(group_cols).agg(
             prob_max=('prob', 'max'),
             prob_mean=('prob', 'mean'),
-            n_hours_above_50=('prob', lambda s: (s > 0.5).sum()),
+            n_hours_critical=('prob', lambda s: (s > opt_threshold).sum()),
             y_true_week=('y_true_hour', 'max'),
         ).reset_index()
  
         weekly['prob_week'] = weekly['prob_max'] if agg == "max" else weekly['prob_mean']
+        weekly['plexos_flag_pred'] = (weekly['n_hours_critical'] >= 1).astype(int)
         return weekly
  
     @staticmethod
@@ -166,13 +167,26 @@ class WeeklyAggregator:
         print(classification_report(weekly['y_true_week'], preds_week, zero_division=0))
         precision, recall, _ = precision_recall_curve(weekly['y_true_week'], weekly['prob_week'])
         print(f"PR-AUC (niveau semaine): {auc(recall, precision):.4f}")
+
+        print("\n==================================================")
+        print(f"DIAGNOSTIC HEBDOMADAIRE (agrégation post-hoc, seuil= 0.75)")
+        print("==================================================")
+        print(classification_report(weekly['y_true_week'], weekly['plexos_flag_pred'], zero_division=0))
+        precision, recall, _ = precision_recall_curve(weekly['y_true_week'], weekly['plexos_flag_pred'])
+
+        print(f"PR-AUC (niveau semaine): {auc(recall, precision):.4f}")
         print("==================================================\n")
 
  
 class ScarcityPredictorPipeline:
-    """Classe orchestrant l'entraînement du modèle XGBoost et l'évaluation."""
-    def __init__(self, feature_cols: list):
+    """Model-agnosting pipeline for scarcity prediction using XGBoost, LightGBM or RandomForest
+       Same GroupKFold, same evaluation via WeeklyAggregator
+    """
+    SUPPORTED_MODELS = ['xgboost', 'lightgbm', 'randomforest']
+
+    def __init__(self, feature_cols: list, model_type: str = 'xgboost'):
         self.feature_cols = feature_cols
+        self.model_type = model_type
         self.model = None
         self.X_test = None
         self.X_test_full = None # X_test with all columns for post-hoc visualization
@@ -180,26 +194,12 @@ class ScarcityPredictorPipeline:
         self.X_train = None
         self.y_train = None
 
-    def weekly_from_hourly_probs(self, X: pd.DataFrame, y_hourly: pd.Series, probs_hourly: np.ndarray) -> pd.DataFrame:
-        """
-        Agrège les probabilités horaires prédites + le vrai flag horaire au niveau semaine,
-        pour évaluer la décision opérationnelle réelle (déclencher ou non LA semaine).
-        """
-        df = X[['Bidding Zone']].copy()
-        iso = df.index.isocalendar()
-        df['ISO_Year'] = iso['year'].values
-        df['ISO_Week'] = iso['week'].values
-        df['prob'] = probs_hourly
-        df['y_true_hour'] = y_hourly.values
-
-        weekly = df.groupby(['Bidding Zone', 'ISO_Year', 'ISO_Week']).agg(
-            prob_max=('prob', 'max'),
-            prob_mean=('prob', 'mean'),
-            n_hours_above_50=('prob', lambda s: (s > 0.5).sum()),
-            y_true_week=('y_true_hour', 'max'),   # vrai flag hebdo (au moins 1h positive)
-        ).reset_index()
-
-        return weekly
+    def _prepare_features(self,X_features: pd.DataFrame) -> pd.DataFrame:
+        """Sélectionne uniquement les colonnes pertinentes pour le modèle."""
+        if self.model_type == 'random_forest' and 'Bidding Zone' in self.feature_cols:
+            # RandomForestClassifier isn't handling categories => one-hot encode the Bidding Zone
+            X_features = pd.get_dummies(X_features, columns=['Bidding Zone'], drop_first=True)
+        return X_features[self.feature_cols]
     def execute_time_series_validation(self, X: pd.DataFrame, y: pd.Series):
         """Découpe les horizons (ex: 2028-2035) proprement pour valider le modèle."""
         # Alignement final des indexes
@@ -210,7 +210,7 @@ class ScarcityPredictorPipeline:
         X_features = X[self.feature_cols]
         
         # GroupKFold : garantit qu'un WS présent dans le train ne sera JAMAIS dans le test
-        gkf = GroupKFold(n_splits=2)
+        gkf = GroupKFold(n_splits=4)
 
         for fold, (train_idx, test_idx) in enumerate(gkf.split(X_features, y, groups)):
             self.X_train, self.X_test = X_features.iloc[train_idx], X_features.iloc[test_idx]
@@ -220,13 +220,13 @@ class ScarcityPredictorPipeline:
             test_scenarios = np.unique(groups[test_idx])
             # Gestion du déséquilibre de classe (Scarcity = événement rare)
             # scale_pos_weight = (nb d'heures normales) / (nb d'heures de scarcity)
-            scale_weight = (sum(self.y_train == 0) / max(1, sum(self.y_train == 1)))
+            scale_weight = np.log(sum(self.y_train == 0) / max(1, sum(self.y_train == 1)))
             print(f"\n--- Training for Fold {fold + 1} ---")
             print(f"Weather Scenarios used for TEST in this Fold : {test_scenarios}")
             print(f"Size of Training set: {len(self.X_train)} hours | Scarcity Events in trainset: {sum(self.y_train == 1)}")
             
             self.model = xgb.XGBClassifier(
-                n_estimators=150,
+                n_estimators=200,
                 max_depth=4,
                 learning_rate=0.05,
                 scale_pos_weight=scale_weight,
@@ -242,11 +242,14 @@ class ScarcityPredictorPipeline:
             # Évaluation
             preds = self.model.predict(self.X_test)
             probs = self.model.predict_proba(self.X_test)[:, 1]
-            print(classification_report(self.y_test, preds, zero_division=0))
+            weekly_diag = WeeklyAggregator.aggregate(self.X_test_full, self.y_test, probs, agg="max")
+            WeeklyAggregator.evaluate(weekly_diag, threshold=0.5)
 
-            precision, recall, _ = precision_recall_curve(self.y_test, probs)
-            print(f"PR-AUC (Indicateur clé Crises Rares): {auc(recall, precision):.4f}")
-            PowerSystemDiagnostics.analyze_prediction_thresholds(self.y_test, probs)
+            # print(classification_report(self.y_test, preds, zero_division=0))
+
+            # precision, recall, _ = precision_recall_curve(self.y_test, probs)
+            # print(f"PR-AUC (Indicateur clé Crises Rares): {auc(recall, precision):.4f}")
+            # PowerSystemDiagnostics.analyze_prediction_thresholds(self.y_test, probs)
 
         return self.X_train, self.y_train, self.X_test, self.y_test  # Retourne le dernier fold pour visualisation
 
@@ -288,22 +291,22 @@ if __name__ == "__main__":
 
     pipeline = ScarcityPredictorPipeline(feature_cols=features_to_use)
     X_train, y_train, X_test, y_test = pipeline.execute_time_series_validation(X, y)
-    print(f"Overview of the training set : len {len(X_train)} \n{X_train.head(20)} \n{y_train.head(20)} ")
-    print(f"Overview of the test set : len {len(X_test)} \n{X_test.head(20)} \n{y_test.head(20)} ")
+    # print(f"Overview of the training set : len {len(X_train)} \n{X_train.head(20)} \n{y_train.head(20)} ")
+    # print(f"Overview of the test set : len {len(X_test)} \n{X_test.head(20)} \n{y_test.head(20)} ")
     probs_test = pipeline.model.predict_proba(X_test)[:, 1]
 
-    weekly_diag = WeeklyAggregator.aggregate(pipeline.X_test_full, y_test, probs_test, agg="max")
-    WeeklyAggregator.evaluate(weekly_diag, threshold=0.5)
+    # weekly_diag = WeeklyAggregator.aggregate(pipeline.X_test_full, y_test, probs_test, agg="max")
+    # WeeklyAggregator.evaluate(weekly_diag, threshold=0.5)
     # print(classification_report(weekly_diag['y_true_week'], preds_week, zero_division=0))
     # precision, recall, _ = precision_recall_curve(weekly_diag['y_true_week'], weekly_diag['prob_max'])
     # print(f"PR-AUC (niveau semaine, agrégé): {auc(recall, precision):.4f}")    # Génération et sauvegarde automatique de l'HTML global sans blocage d'affichage
-    InteractiveScarcityVisualizer.save_interactive_profile(
-        df_test_features=X_test,
-        y_true=y_test,
-        y_probs=probs_test,
-        bidding_zone="DE00",      # Zone à visualiser
-        threshold=0.05,          # Seuil configuré
-        output_dir="output",     # Dossier cible
-        file_name="scarcity_global_profile_DE00.html"
-    )
+    # InteractiveScarcityVisualizer.save_interactive_profile(
+        # df_test_features=X_test,
+        # y_true=y_test,
+        # y_probs=probs_test,
+        # bidding_zone="DE00",      # Zone à visualiser
+        # threshold=0.05,          # Seuil configuré
+        # output_dir="output",     # Dossier cible
+        # file_name="scarcity_global_profile_DE00.html"
+    # )
     
