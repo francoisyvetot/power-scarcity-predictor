@@ -5,13 +5,12 @@ from sklearn.inspection import permutation_importance
 import shap
 
 
-class PowerSystemDiagnostics:
-    """Outils d'analyse physique et spatiale pour l'adéquation du réseau."""
-    
+class PowerSystemDiagnostics:  
+    @staticmethod  
     def log_spatial_correlations(df_system: pd.DataFrame):
-        """Calcule et affiche la co-occurrence des événements de scarcity entre les pays."""
+        """Co-occurrence of scarcity events between countries"""
         print("\n==================================================")
-        print("DIAGNOSTIC : CO-OCCURRENCE DE LA SCARCITY (CORRÉLATION SPATIALE)")
+        print("DIAGNOSTIC : CO-OCCURRENCE OF SCARCITY EVENTS (SPATIAL CORRELATION)")
         print("==================================================")
         
         # On crée une table pivot : Index = Datetime/WS, Colonnes = Pays, Valeurs = 1 si scarcity
@@ -26,16 +25,16 @@ class PowerSystemDiagnostics:
         
         # Calcul de la matrice de corrélation de Pearson sur les événements binaires
         corr_matrix = binary_scarcity.corr()
-        print("Matrice de corrélation spatiale des événements de Scarcity :")
+        print("Correlation Matrix of Spatial Correlation of Scarcity Events :")
         print(corr_matrix.round(3))
-        print("\nInterprétation : Un score proche de 1 indique que les deux zones tombent en panne en même temps.")
+        print("\nInterpretation : A score close to 1 indicates that the two zones fail at the same time.")
         print("==================================================\n")
 
     @staticmethod
     def analyze_prediction_thresholds(y_true, y_probs):
-        """Analyse l'impact du seuil de probabilité sur le Recall et la Précision."""
+        """Analyse the impact of the probability threshold on Recall and Precision."""
         print("\n==================================================")
-        print("DIAGNOSTIC : OPTIMISATION DU SEUIL DE DÉCISION (THRESHOLD)")
+        print("DIAGNOSTIC : OPTIMIZATION OF THE DECISION THRESHOLD (THRESHOLD)")
         print("==================================================")
         
         precisions, recalls, thresholds = precision_recall_curve(y_true, y_probs)
@@ -48,7 +47,7 @@ class PowerSystemDiagnostics:
         })
         
         # On filtre pour afficher des seuils clés
-        print(f"{'Seuil Proba':<15} | {'Précision':<12} | {'Recall (Taux de détection)':<25}")
+        print(f"{'Threshold':<15} | {'Precision':<12} | {'Recall (Detection Rate)':<25}")
         print("-" * 60)
         for target_recall in [0.90, 0.75, 0.50, 0.25]:
             # Trouver le seuil qui s'approche le plus du recall visé
@@ -60,7 +59,7 @@ class PowerSystemDiagnostics:
     # Logs of importance for each features
     @staticmethod
     def log_permutation_importance(model, X_test: pd.DataFrame, y_test: pd.Series):
-        """2. Calcule la baisse de PR-AUC lorsqu'une variable est permutée (bruitée)."""
+        """Calculates the drop in PR-AUC when a feature is permuted (noised)."""
         print("\n==================================================")
         print("DIAGNOSTIC : PERMUTATION IMPORTANCE (IMPACT SUR PR-AUC)")
         print("==================================================")
@@ -87,12 +86,12 @@ class PowerSystemDiagnostics:
         }).sort_values(by='Mean_PR_AUC_Drop', ascending=False)
 
         print(df_perm.to_string(index=False))
-        print("\nInterprétation : Une valeur positive élevée indique que dégrader la variable fait chuter le PR-AUC.")
+        print("\nInterpretation : A high positive value indicates that degrading the feature reduces the PR-AUC.")
         print("==================================================\n")
 
     @staticmethod
     def log_feature_importance_gain(model, feature_names: list):
-        """1. Affiche l'importance native basée sur le Gain."""
+        """Displays the native importance based on the Gain."""
         booster = model.get_booster()
         score_gain = booster.get_score(importance_type='gain')
         
@@ -110,24 +109,29 @@ class PowerSystemDiagnostics:
     
     @staticmethod
     def log_shap_scarcity_impact(model, X_test: pd.DataFrame, y_test: pd.Series):
-        """3. Affiche l'impact SHAP moyen lors des vraies heures de Scarcity (y=1)."""
+        """3. Displays the average SHAP impact during actual scarcity hours (y=1)."""
         print("\n==================================================")
-        print("DIAGNOSTIC : SHAP VALUES (IMPACT LORS DES CRISES)")
+        print("DIAGNOSTIC : SHAP VALUES (IMPACT DURING CRISES)")
         print("==================================================")
         
-        # Isoler uniquement les heures où une réelle scarcity a eu lieu
+        # Isolate only the hours where a real scarcity occurred
         scarcity_idx = (y_test == 1)
         if scarcity_idx.sum() == 0:
-            print("Aucune heure de scarcity dans ce test set pour calculer SHAP.")
+            print("No scarcity hours in this test set for calculating SHAP.")
             return
 
         X_scarcity = X_test.loc[scarcity_idx]
         
-        # Explainer XGBoost
+        # Explainer XGBoost, LightGBM or RandomForest
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_scarcity)
+
+        if isinstance(shap_values, list):
+            shap_values = shap_values[1] 
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            shap_values = shap_values[:,:,1]  
         
-        # Calcul de l'impact moyen absolu sur la prédiction lors des crises
+        # Calcul of the average absolute impact on the prediction during crises
         mean_abs_shap = np.abs(shap_values).mean(axis=0)
         
         df_shap = pd.DataFrame({
