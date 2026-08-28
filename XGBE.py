@@ -158,8 +158,9 @@ if __name__ == "__main__":
         'Net_Load_Lag_1', 'Net_Load_Lag_24'
     ] + res_techs
 
-    # cv_splitter = LeaveOneTargetYearOut() # Or GroupKFold(n_splits=4) / StratifiedGroupKFold(n_splits=4) to split on the WS
-    cv_splitter = GroupKFold(n_splits=4)
+    cv_splitter = LeaveOneTargetYearOut() # Or GroupKFold(n_splits=4) / StratifiedGroupKFold(n_splits=4) to split on the WS
+    # cv_splitter = GroupKFold(n_splits=4)
+    # cv_splitter = StratifiedGroupKFold(n_splits=4)
     results = {}
     for model_type in ['lightgbm']:
         print(f"\n\n########## MODEL: {model_type.upper()} ##########")

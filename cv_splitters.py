@@ -38,3 +38,32 @@ class LeaveOneTargetYearOut:
 
     def get_n_splits(self, X: pd.DataFrame, y=None, groups=None) -> int:
         return len(self._resolve_ty_values(X))
+
+
+def build_cv_splitter(cv_config: dict):
+    """
+    Fabrique un splitter à partir du bloc 'cv' de config.yaml. Point d'extension
+    unique : ajouter une stratégie ici la rend disponible pour les deux grains
+    (hourly_pipeline.py et weekly_pipeline.py) sans y toucher.
+ 
+    cv_config attendu, p.ex. :
+        cv:
+          strategy: leave_one_ty_out
+        # ou
+        cv:
+          strategy: group_kfold
+          n_splits: 4
+    """
+    strategy = cv_config.get('strategy', 'leave_one_ty_out')
+    if strategy == 'leave_one_ty_out':
+        return LeaveOneTargetYearOut()
+    if strategy == 'group_kfold':
+        from sklearn.model_selection import GroupKFold
+        return GroupKFold(n_splits=cv_config.get('n_splits', 4))
+    if strategy == 'stratified_group_kfold':
+        from sklearn.model_selection import StratifiedGroupKFold
+        return StratifiedGroupKFold(n_splits=cv_config.get('n_splits', 4), shuffle=True, random_state=42)
+    raise ValueError(
+        f"Stratégie de CV inconnue: '{strategy}'. Attendu: "
+        "'leave_one_ty_out', 'group_kfold', ou 'stratified_group_kfold'."
+    )

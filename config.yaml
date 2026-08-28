@@ -1,0 +1,93 @@
+# Config unique pilotant le pipeline scarcity (main.py).
+# Changer de méthode (hourly-vers-weekly vs weekly-natif) = changer "grain" ici,
+# rien d'autre. Toutes les listes de features sont éditées ici plutôt que
+# décommentées à la main dans le code -- historique versionnable dans git.
+
+grain: hourly   # "hourly" (entraîne horaire, évalue semaine) ou "weekly" (natif semaine)
+
+data:
+  path: "C:\\Users\\fyvetot\\Documents\\Datasets\\EVA_IDP37"
+  # bidding_zones: [DE00, FR00, BE00, CZ00, HU00, IE00, NL00, PL00, SK00, UKNI]
+  bidding_zones : ["DE00","FR00","NL00","BE00","AT00","ES00","PT00","ITN1",
+                  "PL00","CZ00","HU00","SE03","DKW1","UK00","IE00"]
+  weather_scenarios:
+    [WS01, WS02, WS03, WS05, WS06, WS07, WS08, WS09, WS10, WS11,
+     WS12, WS13, WS14, WS15, WS16, WS17, WS18, WS19, WS20, WS21,
+     WS22, WS23, WS24, WS25, WS26, WS27, WS28, WS29, WS30, WS31,
+     WS32, WS33, WS34, WS35, WS36]
+  
+  target_years: [2030, 2033, 2035]   # LeaveOneTargetYearOut a besoin d'au moins 2 valeurs ici
+  # Les 16 WS réellement visées en déploiement -- fixes, connues à l'avance.
+  # Le train utilise TOUTES les weather_scenarios ci-dessus (jamais restreint à
+  # cette liste), seule l'ÉVALUATION est filtrée dessus en plus de l'évaluation générale.
+  target_ws:
+    [WS03, WS06, WS07, WS10, WS12, WS14, WS15, WS16,
+     WS17, WS18, WS19, WS20, WS25, WS27, WS29, WS31]
+
+model:
+  types: [lightgbm]   # un run par type, dans cet ordre
+
+thresholds:
+  hourly_to_weekly_agg: 0.75
+  weekly_evaluation: [0.3, 0.5, 0.75] # Peut être une liste ou une valeur unique
+  
+cv:
+  strategy: leave_one_ty_out   # ou "group_kfold" / "stratified_group_kfold" (voir cv_splitters.py)
+  # n_splits: 4                # utilisé seulement par group_kfold / stratified_group_kfold
+  val_fraction: 0.2            # part des scénarios de train réservée à l'early stopping interne
+
+# Paramètres spécifiques à la construction des features hebdomadaires natives
+# (ignorés quand grain: hourly).
+weekly_feature_engineering:
+  low_res_quantile: 0.10
+  ramp_quantile: 0.90
+  min_hours_per_week: 150
+
+ablation:
+  enabled: false
+  drop_features: [Net_Load_Core]
+  model_type: xgboost
+
+features:
+  hourly:
+    - Bidding Zone
+    - Net_Load
+    - Net_Load_Core
+    - DayOfWeek
+    - ISO_Week
+    - Month
+    - Hour_sin
+    - Hour_cos
+    - is_off_day
+    - bridge_day
+    - Ramp_Net_Load_1h
+    - Ramp_Net_Load_3h
+    - Wind_mean_3h
+    - Wind_mean_12h
+    - Wind_mean_24h
+    - PV_Peak_mean_24h
+    - Net_Load_Lag_1
+    - Net_Load_Lag_24
+    - Offshore
+    - PV
+    - Onshore
+
+  weekly:
+    - Bidding Zone
+    - TY
+    - Net_Load_Core_Peak_p95
+    - Net_Load_Core_ExSelf_mean
+    - Pos_Ramp_Max
+    - Neg_Ramp_Max
+    - Total_RES_mean
+    - Total_RES_min
+    - Onshore_min
+    - Offshore_min
+    - PV_Peak_mean
+    - RES_Drop_max
+    - Low_RES_Hours
+    - Longest_Low_RES_Run
+    - Month
+    - ISO_Week
+    - Net_Load_Core_mean_Lag_1w
+    - Net_Load_Peak_mean_Lag_1w
