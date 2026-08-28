@@ -3,7 +3,7 @@
 # rien d'autre. Toutes les listes de features sont éditées ici plutôt que
 # décommentées à la main dans le code -- historique versionnable dans git.
 
-grain: hourly   # "hourly" (entraîne horaire, évalue semaine) ou "weekly" (natif semaine)
+grain: weekly   # "hourly" (entraîne horaire, évalue semaine) ou "weekly" (natif semaine)
 
 data:
   path: "C:\\Users\\fyvetot\\Documents\\Datasets\\EVA_IDP37"
@@ -30,7 +30,7 @@ model:
 thresholds:
   hourly_to_weekly_agg: 0.75
   weekly_evaluation: [0.3, 0.5, 0.75] # Peut être une liste ou une valeur unique
-  
+
 cv:
   strategy: leave_one_ty_out   # ou "group_kfold" / "stratified_group_kfold" (voir cv_splitters.py)
   # n_splits: 4                # utilisé seulement par group_kfold / stratified_group_kfold
